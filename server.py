@@ -1,11 +1,6 @@
 """
-Комменты писала нейросеть, за их качество не ручаюсь
-Но вроде полного бреда нету
-"""
-
-"""
 Zab API — бэкенд для школьного портала.
-Версия 1.2.0
+Версия 1.3.0
 
 Основные возможности:
   - JWT-аутентификация (access + refresh токены)
@@ -33,19 +28,19 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import AsyncGenerator, Optional
 
 import jwt
-from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, status
+from bcrypt import checkpw, gensalt, hashpw
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Query, Request, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from passlib.context import CryptContext
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import Column, Integer, String, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
-from bcrypt import gensalt, hashpw, checkpw
 
 logger = logging.getLogger(__name__)
 
@@ -53,34 +48,30 @@ logger = logging.getLogger(__name__)
 # Конфигурация из переменных окружения
 # ---------------------------------------------------------------------------
 
-# URL базы данных. По умолчанию SQLite с асинхронным драйвером aiosqlite.
-# Для PostgreSQL используйте: postgresql+asyncpg://user:pass@host/dbname
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./zabdata.db")
-
-# Если ENV=development — включаем отладочный вывод SQL-запросов через echo
-IS_DEV = os.getenv("ENV", "development") == "development"
-
-# Секретный ключ для подписи JWT. ОБЯЗАТЕЛЬНО менять в продакшене!
+DATABASE_URL      = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./zabdata.db")
+IS_DEV            = os.getenv("ENV", "development") == "development"
 JWT_SECRET        = os.getenv("JWT_SECRET", "PLACEHOLDER")
-JWT_ALGORITHM     = "HS256"                           # Алгоритм подписи токена
-ACCESS_TOKEN_TTL  = int(os.getenv("ACCESS_TOKEN_TTL",  "30"))     # минуты
-REFRESH_TOKEN_TTL = int(os.getenv("REFRESH_TOKEN_TTL", "43200"))  # минуты (30 дней)
+JWT_ALGORITHM     = "HS256"
+ACCESS_TOKEN_TTL  = int(os.getenv("ACCESS_TOKEN_TTL",  "30"))
+REFRESH_TOKEN_TTL = int(os.getenv("REFRESH_TOKEN_TTL", "43200"))
 
-# Асинхронный движок SQLAlchemy. echo=IS_DEV логирует SQL только в dev-режиме.
 engine       = create_async_engine(DATABASE_URL, echo=IS_DEV)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
-# Функции для хеширования и проверки паролей
+
+# ---------------------------------------------------------------------------
+# Утилиты паролей
+# ---------------------------------------------------------------------------
+
 def hash_password(password: str) -> str:
-    salt = gensalt()
-    return hashpw(password.encode('utf-8'), salt).decode('utf-8')
+    return hashpw(password.encode("utf-8"), gensalt()).decode("utf-8")
+
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return checkpw(plain.encode('utf-8'), hashed.encode('utf-8'))
+    return checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
-# OAuth2-схема: токен берётся из заголовка Authorization: Bearer <token>.
-# auto_error=False — не выбрасывает 401 автоматически; это позволяет
-# реализовывать необязательную авторизацию через зависимость optional_user.
+
+# OAuth2-схема: авто-ошибка отключена для поддержки необязательной авторизации
 oauth2 = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
 
@@ -103,8 +94,7 @@ class UserORM(Base):
       editor      — может редактировать данные напрямую + рецензировать proposals
       admin       — полный доступ, включая создание пользователей и удаление записей
 
-    Карма:
-      Увеличивается на 1 при одобрении предложения, уменьшается на 1 при отклонении.
+    Карма: +1 при одобрении предложения, -1 при отклонении.
     """
     __tablename__ = "users"
 
@@ -112,9 +102,9 @@ class UserORM(Base):
     username      = Column(String,  unique=True, nullable=False, index=True)
     password_hash = Column(String,  nullable=False)
     role          = Column(String,  nullable=False, default="viewer")
-    first_name    = Column(String,  nullable=True)   # Имя пользователя (опционально)
-    last_name     = Column(String,  nullable=True)   # Фамилия пользователя (опционально)
-    karma         = Column(Integer, nullable=False, default=0)  # Карма пользователя
+    first_name    = Column(String,  nullable=True)
+    last_name     = Column(String,  nullable=True)
+    karma         = Column(Integer, nullable=False, default=0)
 
 
 class OlympiadORM(Base):
@@ -124,13 +114,14 @@ class OlympiadORM(Base):
     id          = Column(Integer, primary_key=True, index=True)
     name        = Column(String,  nullable=False)
     description = Column(String,  nullable=True)
-    subject     = Column(String,  nullable=False)               # Предмет (индекс для быстрой фильтрации)
-    date        = Column(String,  nullable=False)               # Дата проведения: YYYY-MM-DD
+    subject     = Column(String,  nullable=False)
+    date_start  = Column(String,  nullable=False)   # YYYY-MM-DD
+    date_end    = Column(String,  nullable=True)    # YYYY-MM-DD
     time        = Column(String,  nullable=True)
-    classes     = Column(String,  nullable=False)               # Классы-участники, например "9-11"
+    classes     = Column(String,  nullable=False)   # например "9-11"
     stage       = Column(String,  nullable=True)
-    level       = Column(Integer, nullable=True)                # Уровень
-    link        = Column(String,  nullable=True)                # Ссылка на материалы (опционально)
+    level       = Column(Integer, nullable=True)
+    link        = Column(String,  nullable=True)
 
 
 class ScheduleORM(Base):
@@ -138,66 +129,61 @@ class ScheduleORM(Base):
     __tablename__ = "schedule"
 
     id          = Column(Integer, primary_key=True, index=True)
-    class_name  = Column(String,  nullable=False, index=True)  # Например, "10A"
-    weekday     = Column(Integer, nullable=False, index=True)  # 0=пн, 1=вт, ..., 6=вс
-    lesson_num  = Column(Integer, nullable=False)               # Номер урока: 1..20
+    class_name  = Column(String,  nullable=False, index=True)  # например "10A"
+    weekday     = Column(Integer, nullable=False, index=True)  # 0=пн … 6=вс
+    lesson_num  = Column(Integer, nullable=False)
     subject     = Column(String,  nullable=False)
     teacher     = Column(String,  nullable=True)
     room        = Column(String,  nullable=True)
-    time_start  = Column(String,  nullable=True)               # Время начала: HH:MM
-    time_end    = Column(String,  nullable=True)               # Время окончания: HH:MM
+    time_start  = Column(String,  nullable=True)   # HH:MM
+    time_end    = Column(String,  nullable=True)   # HH:MM
 
 
 class ProposalORM(Base):
     """
     Предложение изменения от contributor.
-
-    Жизненный цикл записи: pending → approved | rejected.
-    При статусе approved изменение применяется к БД автоматически
-    в обработчике POST /proposals/{id}/review.
+    Жизненный цикл: pending → approved | rejected.
     """
     __tablename__ = "proposals"
 
     id          = Column(Integer, primary_key=True, index=True)
-    author      = Column(String,  nullable=False, index=True)    # username автора предложения
+    author      = Column(String,  nullable=False, index=True)
     entity_type = Column(String,  nullable=False)                # "olympiad" | "schedule"
-    entity_id   = Column(Integer, nullable=True)                 # NULL → предложение создать новую запись
+    entity_id   = Column(Integer, nullable=True)                 # NULL → create
     action      = Column(String,  nullable=False)                # "create" | "update" | "delete"
-    payload     = Column(String,  nullable=False)                # JSON-строка с данными изменения
-    status      = Column(String,  nullable=False, default="pending")  # pending | approved | rejected
+    payload     = Column(String,  nullable=False)                # JSON-строка
+    status      = Column(String,  nullable=False, default="pending")
     created_at  = Column(String,  nullable=False)                # ISO datetime UTC
-    reviewed_by = Column(String,  nullable=True)                 # username рецензента
-    review_note = Column(String,  nullable=True)                 # Комментарий при отклонении
+    reviewed_by = Column(String,  nullable=True)
+    review_note = Column(String,  nullable=True)
 
 
 # ---------------------------------------------------------------------------
 # Pydantic-схемы (DTO)
 # ---------------------------------------------------------------------------
 
-# Переиспользуемые Field-ограничения для единообразной валидации
+# Переиспользуемые ограничения полей
 _NAME   = Field(..., min_length=1, max_length=200)
 _SHORT  = Field(..., min_length=1, max_length=100)
 _OPT30  = Field(None, max_length=30)
 _OPT100 = Field(None, max_length=100)
 _OPT500 = Field(None, max_length=500)
-_TIME   = Field(None, pattern=r"^\d{2}:\d{2}$")   # Формат HH:MM
+_TIME   = Field(None, pattern=r"^\d{2}:\d{2}$")
+
 
 # --- Аутентификация и пользователи ---
 
 class TokenPair(BaseModel):
-    """Пара токенов, возвращаемая при логине и обновлении."""
     access_token:  str
     refresh_token: str
     token_type:    str = "bearer"
 
 
 class RefreshRequest(BaseModel):
-    """Тело запроса на обновление токенов."""
     refresh_token: str
 
 
 class UserCreate(BaseModel):
-    """Данные для создания нового пользователя (только для admin)."""
     username:   str           = Field(..., min_length=3, max_length=50)
     password:   str           = Field(..., min_length=8, max_length=128)
     role:       str           = Field("viewer", pattern=r"^(viewer|contributor|editor|admin)$")
@@ -206,7 +192,6 @@ class UserCreate(BaseModel):
 
 
 class UserRead(BaseModel):
-    """Публичное представление пользователя (без пароля)."""
     id:         int
     username:   str
     role:       str
@@ -217,7 +202,7 @@ class UserRead(BaseModel):
 
 
 class UserUpdate(BaseModel):
-    """Обновление профиля: только имя и фамилия. Роль/пароль не меняются."""
+    """Обновление профиля: только имя и фамилия."""
     first_name: Optional[str] = Field(None, min_length=1, max_length=100)
     last_name:  Optional[str] = Field(None, min_length=1, max_length=100)
 
@@ -225,38 +210,47 @@ class UserUpdate(BaseModel):
 # --- Олимпиады ---
 
 class OlympiadBase(BaseModel):
-    """Базовая схема олимпиады — для создания и полного обновления (PUT)."""
     name:        str           = _NAME
-    description: str           = _OPT500
+    description: Optional[str] = _OPT500
     subject:     str           = _SHORT
-    date:        str           = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
-    time:        str           = _TIME
+    date_start:  str           = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    date_end:    Optional[str] = Field(None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    time:        Optional[str] = _TIME
     classes:     str           = Field(..., pattern=r"^(?:[1-9]|10|11)-(?:[1-9]|10|11)$")
-    stage:       str           = _OPT30
-    level:       int           = Field(None, ge=1, le=3)
+    stage:       Optional[str] = _OPT30
+    level:       Optional[int] = Field(default=1, ge=1, le=3)
     link:        Optional[str] = _OPT500
+    @model_validator(mode="after")
+    def check_dates(self):
+        if self.date_end is not None and self.date_end < self.date_start:
+            raise ValueError("date_end не может быть раньше date_start")
+        return self
 
 
 class OlympiadRead(OlympiadBase):
-    """Схема чтения олимпиады (добавляет id)."""
     id: int
     model_config = {"from_attributes": True}
 
 
 class OlympiadUpdate(BaseModel):
-    """Схема частичного обновления олимпиады (все поля опциональны, для PATCH)."""
+    """Частичное обновление олимпиады (PATCH)."""
     name:        Optional[str] = Field(None, min_length=1, max_length=100)
     description: Optional[str] = Field(None, min_length=1, max_length=500)
     subject:     Optional[str] = Field(None, min_length=1, max_length=100)
-    date:        Optional[str] = Field(None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    date_start:  Optional[str] = Field(None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    date_end:    Optional[str] = Field(None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     time:        Optional[str] = Field(None, pattern=r"^\d{2}:\d{2}$")
     classes:     Optional[str] = Field(None, min_length=1, max_length=100)
     level:       Optional[int] = Field(None, ge=1, le=3)
     link:        Optional[str] = Field(None, max_length=500)
+    @model_validator(mode="after")
+    def check_dates(self):
+        if self.date_end is not None and self.date_end < self.date_start:
+            raise ValueError("date_end не может быть раньше date_start")
+        return self
 
 
 class OlympiadResponse(BaseModel):
-    """Стандартный ответ для эндпоинтов олимпиад."""
     success: bool
     data:    list[OlympiadRead]
     error:   Optional[str] = None
@@ -265,9 +259,8 @@ class OlympiadResponse(BaseModel):
 # --- Расписание ---
 
 class ScheduleBase(BaseModel):
-    """Базовая схема урока — для создания и полного обновления (PUT)."""
-    class_name:  str           = Field(..., min_length=2, max_length=3)
-    weekday:     int           = Field(..., ge=0, le=6)   # 0=пн, 6=вс
+    class_name:  str           = Field(..., min_length=1, max_length=30)
+    weekday:     int           = Field(..., ge=0, le=6)
     lesson_num:  int           = Field(..., ge=1, le=20)
     subject:     str           = _SHORT
     teacher:     Optional[str] = _OPT100
@@ -277,14 +270,13 @@ class ScheduleBase(BaseModel):
 
 
 class ScheduleRead(ScheduleBase):
-    """Схема чтения урока (добавляет id)."""
     id: int
     model_config = {"from_attributes": True}
 
 
 class ScheduleUpdate(BaseModel):
-    """Схема частичного обновления урока (все поля опциональны, для PATCH)."""
-    class_name:  Optional[str] = Field(None, in_length=2, max_length=3)
+    """Частичное обновление урока (PATCH)."""
+    class_name:  Optional[str] = Field(None, min_length=1, max_length=30)
     weekday:     Optional[int] = Field(None, ge=0, le=6)
     lesson_num:  Optional[int] = Field(None, ge=1, le=20)
     subject:     Optional[str] = Field(None, min_length=1, max_length=100)
@@ -295,7 +287,6 @@ class ScheduleUpdate(BaseModel):
 
 
 class ScheduleResponse(BaseModel):
-    """Стандартный ответ для эндпоинтов расписания."""
     success: bool
     data:    list[ScheduleRead]
     error:   Optional[str] = None
@@ -305,12 +296,10 @@ class ScheduleResponse(BaseModel):
 
 class ProposalCreate(BaseModel):
     """
-    Тело запроса на создание предложения изменения.
-
     Правила согласованности action/entity_id:
-      - action=create  → entity_id должен быть None; payload — полные данные новой записи
-      - action=update  → entity_id обязателен; payload — изменяемые поля (как в PATCH)
-      - action=delete  → entity_id обязателен; payload может быть пустым {}
+      - create → entity_id=None, payload — полные данные новой записи
+      - update → entity_id обязателен, payload — изменяемые поля
+      - delete → entity_id обязателен, payload может быть {}
     """
     entity_type: str           = Field(..., pattern=r"^(olympiad|schedule)$")
     entity_id:   Optional[int] = None
@@ -319,19 +308,17 @@ class ProposalCreate(BaseModel):
 
 
 class ProposalReview(BaseModel):
-    """Тело запроса при рецензировании предложения (editor/admin)."""
     decision:    str           = Field(..., pattern=r"^(approved|rejected)$")
     review_note: Optional[str] = Field(None, max_length=500)
 
 
 class ProposalRead(BaseModel):
-    """Публичное представление предложения изменения."""
     id:          int
     author:      str
     entity_type: str
     entity_id:   Optional[int]
     action:      str
-    payload:     dict           # Десериализованный JSON из БД
+    payload:     dict
     status:      str
     created_at:  str
     reviewed_by: Optional[str] = None
@@ -339,7 +326,6 @@ class ProposalRead(BaseModel):
 
     @classmethod
     def from_orm(cls, row: ProposalORM) -> "ProposalRead":
-        """Конвертирует ORM-объект в схему, десериализуя payload из JSON-строки."""
         return cls(
             id=row.id,
             author=row.author,
@@ -355,22 +341,18 @@ class ProposalRead(BaseModel):
 
 
 class ProposalResponse(BaseModel):
-    """Стандартный ответ для эндпоинтов предложений."""
     success: bool
     data:    list[ProposalRead]
     error:   Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
-# FastAPI — инициализация приложения
+# Инициализация FastAPI
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Управление жизненным циклом приложения.
-    При старте создаёт все таблицы в БД (если их ещё нет).
-    """
+    """Создаёт все таблицы при старте приложения."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield
@@ -378,9 +360,8 @@ async def lifespan(app: FastAPI):
 
 def _token_key(request: Request) -> str:
     """
-    Функция формирования ключа для rate-limiter (slowapi).
-    Если запрос содержит валидный Bearer-токен — ключ строится по sub (username),
-    иначе — по IP-адресу клиента. Срок действия токена при этом не проверяется.
+    Ключ для rate-limiter: username из токена или IP-адрес клиента.
+    Срок действия токена при этом не проверяется.
     """
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
@@ -395,19 +376,15 @@ def _token_key(request: Request) -> str:
     return f"ip:{request.client.host}"
 
 
-# Инициализация rate-limiter с кастомным ключом
 limiter = Limiter(key_func=_token_key)
 
-app = FastAPI(title="Zab API", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="Zab API", version="1.3.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """
-    Dependency Injection: выдаёт асинхронную сессию БД для одного запроса.
-    Сессия автоматически закрывается после завершения обработчика.
-    """
+    """DI: выдаёт сессию БД на время одного запроса."""
     async with SessionLocal() as session:
         yield session
 
@@ -417,16 +394,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 # ---------------------------------------------------------------------------
 
 def _make_token(sub: str, role: str, ttl_minutes: int, kind: str) -> str:
-    """
-    Создаёт и подписывает JWT.
-
-    Payload:
-      sub  — идентификатор пользователя (username)
-      role — роль пользователя
-      kind — тип токена: "access" или "refresh"
-      iat  — время создания (UTC)
-      exp  — время истечения (UTC)
-    """
+    """Создаёт подписанный JWT с полями sub, role, kind, iat, exp."""
     now = datetime.now(timezone.utc)
     return jwt.encode(
         {
@@ -442,7 +410,7 @@ def _make_token(sub: str, role: str, ttl_minutes: int, kind: str) -> str:
 
 
 def _make_token_pair(username: str, role: str) -> TokenPair:
-    """Создаёт пару access + refresh токенов для пользователя."""
+    """Создаёт пару access + refresh токенов."""
     return TokenPair(
         access_token=_make_token(username, role, ACCESS_TOKEN_TTL,  "access"),
         refresh_token=_make_token(username, role, REFRESH_TOKEN_TTL, "refresh"),
@@ -452,8 +420,8 @@ def _make_token_pair(username: str, role: str) -> TokenPair:
 def _decode(token: str, expected_kind: str) -> dict:
     """
     Декодирует и валидирует JWT.
-    Проверяет подпись, срок действия и тип токена (kind).
-    Выбрасывает HTTPException 401 при любой ошибке валидации.
+    Проверяет подпись, срок действия и тип токена.
+    Выбрасывает HTTPException 401 при любой ошибке.
     """
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
@@ -473,11 +441,7 @@ def _decode(token: str, expected_kind: str) -> dict:
 # ---------------------------------------------------------------------------
 
 async def current_user(token: Optional[str] = Depends(oauth2)) -> dict:
-    """
-    Обязательная авторизация.
-    Возвращает payload из access-токена или выбрасывает HTTP 401.
-    Используется во всех защищённых эндпоинтах через Depends(current_user).
-    """
+    """Обязательная авторизация. Возвращает payload access-токена или 401."""
     if not token:
         raise HTTPException(status_code=401, detail="Необходима авторизация")
     return _decode(token, "access")
@@ -486,9 +450,7 @@ async def current_user(token: Optional[str] = Depends(oauth2)) -> dict:
 async def optional_user(token: Optional[str] = Depends(oauth2)) -> Optional[dict]:
     """
     Необязательная авторизация.
-    Возвращает payload если токен передан и валиден, иначе None.
-    Используется там, где публичный доступ разрешён, но авторизованный
-    пользователь может получить дополнительные данные.
+    Возвращает payload если токен валиден, иначе None.
     """
     if not token:
         return None
@@ -498,13 +460,13 @@ async def optional_user(token: Optional[str] = Depends(oauth2)) -> Optional[dict
         return None
 
 
+# ИСПРАВЛЕНО: кешируем фабрику через lru_cache — один и тот же набор ролей
+# возвращает одну и ту же функцию-зависимость, а не создаёт новую при каждом вызове
+@lru_cache(maxsize=16)
 def require_role(*roles: str):
     """
-    Фабрика зависимостей для проверки роли пользователя.
-    Выбрасывает HTTP 403 если роль не входит в список разрешённых.
-
-    Пример использования:
-      dependencies=[Depends(require_role("editor", "admin"))]
+    Фабрика зависимостей для проверки роли.
+    Выбрасывает HTTP 403 если роль пользователя не входит в список.
     """
     async def _check(user: dict = Depends(current_user)) -> dict:
         if user.get("role") not in roles:
@@ -513,25 +475,28 @@ def require_role(*roles: str):
     return _check
 
 
-# Готовые зависимости для удобного использования в декораторах
-any_user     = Depends(current_user)                                    # любой авторизованный
-editors      = Depends(require_role("editor", "admin"))                 # editor и admin
-admins       = Depends(require_role("admin"))                           # только admin
-contributors = Depends(require_role("contributor", "editor", "admin"))  # contributor и выше
+# Готовые зависимости
+any_user     = Depends(current_user)
+editors      = Depends(require_role("editor", "admin"))
+admins       = Depends(require_role("admin"))
+contributors = Depends(require_role("contributor", "editor", "admin"))
 
 
 def _db_error(exc: Exception) -> HTTPException:
-    """Логирует неожиданное исключение БД и возвращает унифицированный HTTP 500."""
+    """Логирует исключение БД и возвращает унифицированный HTTP 500."""
     logger.error("DB error: %s", exc, exc_info=True)
     return HTTPException(status_code=500, detail="Внутренняя ошибка сервера")
 
 
 # ---------------------------------------------------------------------------
-# Эндпоинты аутентификации (/auth/*)
+# Роутер: аутентификация (/auth/*)
 # ---------------------------------------------------------------------------
 
-@app.post("/auth/login", response_model=TokenPair,
-          summary="Логин — получить пару токенов")
+auth_router = APIRouter(prefix="/auth", tags=["Аутентификация"])
+
+
+@auth_router.post("/login", response_model=TokenPair,
+                  summary="Логин — получить пару токенов")
 @limiter.limit("10/minute")
 async def login(
     request: Request,
@@ -540,40 +505,35 @@ async def login(
 ):
     """
     Принимает username и password (application/x-www-form-urlencoded).
-    Возвращает access_token (TTL: ACCESS_TOKEN_TTL мин) и refresh_token.
     Лимит: 10 запросов/мин на пользователя или IP.
     """
     row = await db.execute(select(UserORM).where(UserORM.username == form.username))
     user = row.scalars().first()
 
-    # Константное время проверки предотвращает timing-атаки (bcrypt)
     if not user or not verify_password(form.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Неверные учётные данные")
 
     return _make_token_pair(user.username, user.role)
 
 
-@app.post("/auth/refresh", response_model=TokenPair,
-          summary="Обновить токены по refresh-токену")
+@auth_router.post("/refresh", response_model=TokenPair,
+                  summary="Обновить токены по refresh-токену")
 @limiter.limit("20/minute")
 async def refresh(request: Request, body: RefreshRequest):
     """
-    Принимает валидный refresh-токен.
-    Возвращает новую пару access + refresh токенов.
+    Принимает валидный refresh-токен, возвращает новую пару токенов.
     Старый refresh-токен остаётся валидным до истечения TTL
-    (blacklist-инвалидация в текущей версии не реализована).
+    (blacklist-инвалидация не реализована).
     """
     payload = _decode(body.refresh_token, "refresh")
     return _make_token_pair(payload["sub"], payload["role"])
 
 
-@app.post("/auth/register", response_model=UserRead, status_code=201,
-          dependencies=[admins], summary="Создать пользователя (только admin)")
+@auth_router.post("/register", response_model=UserRead, status_code=201,
+                  dependencies=[admins],
+                  summary="Создать пользователя (только admin)")
 async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
-    """
-    Создаёт нового пользователя. Доступно только администраторам.
-    Возвращает HTTP 409 если username уже занят.
-    """
+    """Создаёт пользователя. Только для администраторов. 409 если username занят."""
     existing = await db.execute(select(UserORM).where(UserORM.username == user.username))
     if existing.scalars().first():
         raise HTTPException(status_code=409, detail="Пользователь уже существует")
@@ -592,19 +552,19 @@ async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# Эндпоинты пользователей (/users/*)
+# Роутер: пользователи (/users/*)
 # ---------------------------------------------------------------------------
 
-@app.get("/users/me", response_model=UserRead,
-         summary="Профиль текущего пользователя (с кармой)")
+users_router = APIRouter(prefix="/users", tags=["Пользователи"])
+
+
+@users_router.get("/me", response_model=UserRead,
+                  summary="Профиль текущего пользователя")
 async def get_my_profile(
     user: dict = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Возвращает профиль текущего авторизованного пользователя, включая карму.
-    Удобно для отображения в шапке мобильного приложения.
-    """
+    """Возвращает профиль с кармой. Удобно для шапки приложения."""
     row = await db.execute(select(UserORM).where(UserORM.username == user["sub"]))
     orm_user = row.scalars().first()
     if orm_user is None:
@@ -612,23 +572,19 @@ async def get_my_profile(
     return orm_user
 
 
-@app.patch("/users/me", response_model=UserRead,
-           summary="Обновить имя/фамилию текущего пользователя")
+@users_router.patch("/me", response_model=UserRead,
+                    summary="Обновить имя/фамилию текущего пользователя")
 async def update_profile(
     body: UserUpdate,
     user: dict = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Позволяет любому авторизованному пользователю обновить своё имя и/или фамилию.
-    Изменение роли или пароля через этот эндпоинт недоступно.
-    """
+    """Обновляет имя и/или фамилию. Роль и пароль через этот эндпоинт не меняются."""
     row = await db.execute(select(UserORM).where(UserORM.username == user["sub"]))
     orm_user = row.scalars().first()
     if orm_user is None:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
 
-    # exclude_unset=True — обновляем только явно переданные поля
     for field, value in body.model_dump(exclude_unset=True).items():
         setattr(orm_user, field, value)
 
@@ -638,67 +594,62 @@ async def update_profile(
 
 
 # ---------------------------------------------------------------------------
-# Публичные эндпоинты (/public/*) — авторизация НЕ требуется
+# Роутер: публичные эндпоинты (/public/*) — авторизация не требуется
 # ---------------------------------------------------------------------------
 
-@app.get("/public/schedule/{weekday}", response_model=ScheduleResponse,
-         summary="[Публично] Расписание на конкретный день недели")
+public_router = APIRouter(prefix="/public", tags=["Публичные"])
+
+
+@public_router.get("/schedule/{weekday}", response_model=ScheduleResponse,
+                   summary="Расписание на конкретный день недели")
 @limiter.limit("120/minute")
 async def public_get_schedule_by_day(
     request: Request,
-    # Path(...) — значение берётся из сегмента URL: /public/schedule/1
-    # ВАЖНО: для path-параметров необходимо использовать Path(), а не Query()
     weekday: int = Path(..., ge=0, le=6,
                         description="День недели: 0=понедельник, 6=воскресенье"),
-    # Query-параметр — опциональный, передаётся как ?class_name=10A
-    class_name: Optional[str] = Query(None, max_length=20,
+    class_name: Optional[str] = Query(None, max_length=30,
                                       description="Фильтр по классу, например '10A'"),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Возвращает расписание на указанный день недели без авторизации.
+    Расписание на указанный день без авторизации.
     Результат отсортирован по классу, затем по номеру урока.
 
-    Примеры:
-      GET /public/schedule/0              → всё расписание на понедельник
-      GET /public/schedule/0?class_name=10A → расписание 10А на понедельник
+    GET /public/schedule/0              → всё расписание на понедельник
+    GET /public/schedule/0?class_name=10A → расписание 10А на понедельник
     """
     try:
-        query = (
-            select(ScheduleORM)
-            .where(ScheduleORM.weekday == weekday)
-            .order_by(ScheduleORM.class_name, ScheduleORM.lesson_num)
-        )
+        # ИСПРАВЛЕНО: фильтр по class_name теперь в правильном месте — до order_by
+        query = select(ScheduleORM).where(ScheduleORM.weekday == weekday)
         if class_name:
             query = query.where(ScheduleORM.class_name == class_name)
+        query = query.order_by(ScheduleORM.class_name, ScheduleORM.lesson_num)
         rows = await db.execute(query)
         return ScheduleResponse(success=True, data=rows.scalars().all())
     except Exception as exc:
         raise _db_error(exc) from exc
 
 
-@app.get("/public/olympiads", response_model=OlympiadResponse,
-         summary="[Публично] Список олимпиад с фильтрацией")
+@public_router.get("/olympiads", response_model=OlympiadResponse,
+                   summary="Список олимпиад с фильтрацией")
 @limiter.limit("120/minute")
 async def public_get_olympiads(
     request: Request,
-    date:    Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$",
+    date_start: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$",
                                    description="Фильтр по дате: YYYY-MM-DD"),
-    subject: Optional[str] = Query(None, max_length=100, description="Предмет"),
-    level:   Optional[int] = Query(None, ge=1, le=3,     description="Уровень 1-3"),
-    classes: Optional[str] = Query(None, max_length=100, description="Классы, например '9-11'"),
+    subject:    Optional[str] = Query(None, max_length=100, description="Предмет"),
+    level:      Optional[int] = Query(None, ge=1, le=3,     description="Уровень 1-3"),
+    classes:    Optional[str] = Query(None, max_length=100, description="Классы, например '9-11'"),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Возвращает список олимпиад без авторизации.
-    Все параметры фильтрации опциональны. Результат отсортирован по дате.
-
-    Пример: GET /public/olympiads?date=2025-03-15&level=2
+    Список олимпиад без авторизации. Все фильтры опциональны.
+    Результат отсортирован по дате.
     """
     try:
-        query = select(OlympiadORM).order_by(OlympiadORM.date)
-        if date:
-            query = query.where(OlympiadORM.date == date)
+        query = select(OlympiadORM).order_by(OlympiadORM.date_start)
+        if date_start:
+            query = query.where(OlympiadORM.date_start == date_start)
         if subject:
             query = query.where(OlympiadORM.subject == subject)
         if level is not None:
@@ -711,8 +662,8 @@ async def public_get_olympiads(
         raise _db_error(exc) from exc
 
 
-@app.get("/public/olympiads/{olympiad_id}", response_model=OlympiadResponse,
-         summary="[Публично] Одна олимпиада по ID")
+@public_router.get("/olympiads/{olympiad_id}", response_model=OlympiadResponse,
+                   summary="Одна олимпиада по ID")
 @limiter.limit("120/minute")
 async def public_get_olympiad(
     request: Request,
@@ -727,11 +678,15 @@ async def public_get_olympiad(
 
 
 # ---------------------------------------------------------------------------
-# Эндпоинты олимпиад (/olympiads) — требуют авторизации
+# Роутер: олимпиады (/olympiads) — требуют авторизации
 # ---------------------------------------------------------------------------
 
-@app.post("/olympiads", response_model=OlympiadResponse, status_code=201,
-          dependencies=[editors], summary="Создать олимпиаду (editor+)")
+olympiads_router = APIRouter(prefix="/olympiads", tags=["Олимпиады"])
+
+
+@olympiads_router.post("", response_model=OlympiadResponse, status_code=201,
+                        dependencies=[editors],
+                        summary="Создать олимпиаду (editor+)")
 @limiter.limit("20/minute")
 async def create_olympiad(
     request: Request,
@@ -749,8 +704,9 @@ async def create_olympiad(
         raise _db_error(exc) from exc
 
 
-@app.put("/olympiads/{olympiad_id}", response_model=OlympiadResponse,
-         dependencies=[editors], summary="Полное обновление олимпиады (editor+)")
+@olympiads_router.put("/{olympiad_id}", response_model=OlympiadResponse,
+                       dependencies=[editors],
+                       summary="Полное обновление олимпиады (editor+)")
 @limiter.limit("20/minute")
 async def update_olympiad(
     request: Request,
@@ -775,8 +731,9 @@ async def update_olympiad(
         raise _db_error(exc) from exc
 
 
-@app.patch("/olympiads/{olympiad_id}", response_model=OlympiadResponse,
-           dependencies=[editors], summary="Частичное обновление олимпиады (editor+)")
+@olympiads_router.patch("/{olympiad_id}", response_model=OlympiadResponse,
+                         dependencies=[editors],
+                         summary="Частичное обновление олимпиады (editor+)")
 @limiter.limit("20/minute")
 async def patch_olympiad(
     request: Request,
@@ -784,7 +741,7 @@ async def patch_olympiad(
     olympiad: OlympiadUpdate = ...,
     db: AsyncSession = Depends(get_db),
 ):
-    """Обновляет только переданные поля (exclude_unset=True)."""
+    """Обновляет только переданные поля."""
     try:
         row = await db.get(OlympiadORM, olympiad_id)
         if row is None:
@@ -801,8 +758,9 @@ async def patch_olympiad(
         raise _db_error(exc) from exc
 
 
-@app.delete("/olympiads/{olympiad_id}", response_model=OlympiadResponse,
-            dependencies=[admins], summary="Удалить олимпиаду (только admin)")
+@olympiads_router.delete("/{olympiad_id}", response_model=OlympiadResponse,
+                          dependencies=[admins],
+                          summary="Удалить олимпиаду (только admin)")
 @limiter.limit("20/minute")
 async def delete_olympiad(
     request: Request,
@@ -824,12 +782,16 @@ async def delete_olympiad(
 
 
 # ---------------------------------------------------------------------------
-# Эндпоинты расписания (/schedule) — требуют авторизации
+# Роутер: расписание (/schedule) — требуют авторизации
 # ---------------------------------------------------------------------------
 
-@app.post("/schedule", response_model=ScheduleResponse, status_code=201,
-          dependencies=[editors], summary="Создать урок (editor+)")
-@limiter.limit("20/minute")
+schedule_router = APIRouter(prefix="/schedule", tags=["Расписание"])
+
+
+@schedule_router.post("", response_model=ScheduleResponse, status_code=201,
+                       dependencies=[editors],
+                       summary="Создать урок (editor+)")
+@limiter.limit("2000/minute")
 async def create_lesson(
     request: Request,
     lesson: ScheduleBase,
@@ -846,8 +808,9 @@ async def create_lesson(
         raise _db_error(exc) from exc
 
 
-@app.put("/schedule/{lesson_id}", response_model=ScheduleResponse,
-         dependencies=[editors], summary="Полное обновление урока (editor+)")
+@schedule_router.put("/{lesson_id}", response_model=ScheduleResponse,
+                      dependencies=[editors],
+                      summary="Полное обновление урока (editor+)")
 @limiter.limit("20/minute")
 async def update_lesson(
     request: Request,
@@ -871,8 +834,9 @@ async def update_lesson(
         raise _db_error(exc) from exc
 
 
-@app.patch("/schedule/{lesson_id}", response_model=ScheduleResponse,
-           dependencies=[editors], summary="Частичное обновление урока (editor+)")
+@schedule_router.patch("/{lesson_id}", response_model=ScheduleResponse,
+                        dependencies=[editors],
+                        summary="Частичное обновление урока (editor+)")
 @limiter.limit("20/minute")
 async def patch_lesson(
     request: Request,
@@ -896,8 +860,9 @@ async def patch_lesson(
         raise _db_error(exc) from exc
 
 
-@app.delete("/schedule/{lesson_id}", response_model=ScheduleResponse,
-            dependencies=[admins], summary="Удалить урок (только admin)")
+@schedule_router.delete("/{lesson_id}", response_model=ScheduleResponse,
+                         dependencies=[admins],
+                         summary="Удалить урок (только admin)")
 @limiter.limit("20/minute")
 async def delete_lesson(
     request: Request,
@@ -919,11 +884,14 @@ async def delete_lesson(
 
 
 # ---------------------------------------------------------------------------
-# Эндпоинты предложений изменений (/proposals) — contributor workflow
+# Роутер: предложения изменений (/proposals) — contributor workflow
 # ---------------------------------------------------------------------------
 
-@app.post("/proposals", response_model=ProposalResponse, status_code=201,
-          summary="Предложить изменение (contributor+)")
+proposals_router = APIRouter(prefix="/proposals", tags=["Предложения изменений"])
+
+
+@proposals_router.post("", response_model=ProposalResponse, status_code=201,
+                        summary="Предложить изменение (contributor+)")
 @limiter.limit("30/minute")
 async def create_proposal(
     request: Request,
@@ -932,11 +900,9 @@ async def create_proposal(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Создаёт предложение изменения со статусом pending.
-    Само изменение НЕ применяется — только после одобрения через /proposals/{id}/review.
-    Contributor, editor и admin могут использовать этот эндпоинт.
+    Создаёт предложение со статусом pending.
+    Изменение применяется только после одобрения через /proposals/{id}/review.
     """
-    # Дополнительная валидация согласованности action и entity_id
     if body.action in ("update", "delete") and body.entity_id is None:
         raise HTTPException(status_code=422, detail="entity_id обязателен для update/delete")
     if body.action == "create" and body.entity_id is not None:
@@ -962,13 +928,11 @@ async def create_proposal(
         raise _db_error(exc) from exc
 
 
-@app.get("/proposals", response_model=ProposalResponse,
-         summary="Список всех предложений (editor+)")
+@proposals_router.get("", response_model=ProposalResponse,
+                       summary="Список всех предложений (editor+)")
 @limiter.limit("60/minute")
 async def list_proposals(
     request: Request,
-    # Используем alias="status", чтобы не конфликтовать с встроенным
-    # атрибутом status в Python, но принимать параметр как ?status=pending
     status_filter: Optional[str] = Query(None, alias="status",
                                           pattern=r"^(pending|approved|rejected)$"),
     entity_type:   Optional[str] = Query(None, pattern=r"^(olympiad|schedule)$"),
@@ -976,8 +940,7 @@ async def list_proposals(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Возвращает все предложения, отсортированные по дате (новые сначала).
-    Доступно редакторам и администраторам.
+    Все предложения, новые сначала. Только для editor и admin.
     Фильтры: ?status=pending, ?entity_type=olympiad.
     """
     try:
@@ -993,18 +956,15 @@ async def list_proposals(
         raise _db_error(exc) from exc
 
 
-@app.get("/proposals/my", response_model=ProposalResponse,
-         summary="Мои предложения (любой авторизованный)")
+@proposals_router.get("/my", response_model=ProposalResponse,
+                       summary="Мои предложения (любой авторизованный)")
 @limiter.limit("60/minute")
 async def my_proposals(
     request: Request,
     user: dict = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Возвращает все предложения текущего пользователя (новые сначала).
-    Доступно любому авторизованному пользователю.
-    """
+    """Предложения текущего пользователя, новые сначала."""
     try:
         query = (
             select(ProposalORM)
@@ -1018,8 +978,8 @@ async def my_proposals(
         raise _db_error(exc) from exc
 
 
-@app.get("/proposals/{proposal_id}", response_model=ProposalResponse,
-         summary="Одно предложение по ID (contributor видит только своё, editor+ — любое)")
+@proposals_router.get("/{proposal_id}", response_model=ProposalResponse,
+                       summary="Одно предложение по ID (contributor — только своё, editor+ — любое)")
 @limiter.limit("60/minute")
 async def get_proposal(
     request: Request,
@@ -1027,24 +987,18 @@ async def get_proposal(
     user: dict = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Возвращает одно предложение по ID.
-    Contributor может смотреть только свои предложения (проверка по author).
-    Editor и admin видят любое предложение.
-    """
     proposal = await db.get(ProposalORM, proposal_id)
     if proposal is None:
         raise HTTPException(status_code=404, detail="Предложение не найдено")
 
-    # Contributor может смотреть только свои предложения
     if user["role"] not in ("editor", "admin") and proposal.author != user["sub"]:
         raise HTTPException(status_code=403, detail="Недостаточно прав")
 
     return ProposalResponse(success=True, data=[ProposalRead.from_orm(proposal)])
 
 
-@app.post("/proposals/{proposal_id}/review", response_model=ProposalResponse,
-          summary="Одобрить или отклонить предложение (editor+)")
+@proposals_router.post("/{proposal_id}/review", response_model=ProposalResponse,
+                        summary="Одобрить или отклонить предложение (editor+)")
 @limiter.limit("30/minute")
 async def review_proposal(
     request: Request,
@@ -1054,19 +1008,11 @@ async def review_proposal(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Рецензирование предложения изменения.
+    Рецензирование предложения.
 
-    decision=approved:
-      Статус → approved. Изменение автоматически применяется к БД:
-        create → создаётся новая запись из payload
-        update → обновляются поля записи (как PATCH)
-        delete → запись удаляется
-      Карма автора: +1
-
-    decision=rejected:
-      Статус → rejected. Изменение НЕ применяется.
-      Можно указать review_note с причиной отклонения.
-      Карма автора: -1
+    approved → изменение применяется к БД, карма автора +1.
+    rejected → изменение не применяется, карма автора -1.
+              Можно указать review_note с причиной отклонения.
 
     Повторная рецензия уже рассмотренного предложения → HTTP 409.
     """
@@ -1076,12 +1022,11 @@ async def review_proposal(
     if proposal.status != "pending":
         raise HTTPException(status_code=409, detail="Предложение уже рассмотрено")
 
-    # Обновляем поля рецензии
     proposal.status      = body.decision
     proposal.reviewed_by = user["sub"]
     proposal.review_note = body.review_note
 
-    # Обновляем карму автора предложения
+    # Обновляем карму автора
     karma_delta = +1 if body.decision == "approved" else -1
     author_row = await db.execute(
         select(UserORM).where(UserORM.username == proposal.author)
@@ -1099,14 +1044,12 @@ async def review_proposal(
 
         try:
             if proposal.action == "create":
-                # Создаём новую запись целиком из payload
                 db.add(OrmClass(**payload))
 
             elif proposal.action == "update":
                 row = await db.get(OrmClass, proposal.entity_id)
                 if row is None:
                     raise HTTPException(status_code=404, detail="Исходная запись не найдена")
-                # Применяем только переданные поля (аналогично PATCH)
                 for field, value in payload.items():
                     setattr(row, field, value)
 
@@ -1132,7 +1075,19 @@ async def review_proposal(
 
 
 # ---------------------------------------------------------------------------
-# Точка входа (python server.py)
+# Регистрация роутеров
+# ---------------------------------------------------------------------------
+
+app.include_router(auth_router)
+app.include_router(users_router)
+app.include_router(public_router)
+app.include_router(olympiads_router)
+app.include_router(schedule_router)
+app.include_router(proposals_router)
+
+
+# ---------------------------------------------------------------------------
+# Точка входа
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
