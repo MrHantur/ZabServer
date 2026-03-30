@@ -1,8 +1,8 @@
 # app/schemas.py
 import json as _json
 from datetime import datetime
-from typing import Optional, List
-from pydantic import BaseModel, Field, model_validator
+from typing import Optional, List, Dict
+from pydantic import BaseModel, Field, model_validator, field_validator
 from .models import ProposalORM
 
 _NAME = Field(..., min_length=1, max_length=200)
@@ -52,10 +52,11 @@ class OlympiadBase(BaseModel):
     date_start: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
     date_end: Optional[str] = Field(None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     time: Optional[str] = _TIME
-    classes: str = Field(None, pattern=r"^(?:[1-9]|10|11)-(?:[1-9]|10|11)$")
+    classes: Optional[str] = Field(None, pattern=r"^(?:[1-9]|10|11)-(?:[1-9]|10|11)$")
     stage: Optional[str] = _OPT30
     level: Optional[int] = Field(default=1, ge=1, le=3)
     link: Optional[str] = _OPT500
+    created_by: Optional[Dict[str, str]] = Field(None, min_length=1, max_length=200)
 
     @model_validator(mode="after")
     def check_dates(self):
@@ -69,6 +70,19 @@ class OlympiadRead(OlympiadBase):
     approved_by: Optional[UserInfo] = None
     proposal_id: Optional[int] = None
     model_config = {"from_attributes": True}
+    
+    @field_validator('created_by', 'approved_by', mode='before')
+    @classmethod
+    def parse_json_user(cls, v):
+        """Парсит JSON-строку из БД в dict для валидации UserInfo"""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            try:
+                return _json.loads(v)
+            except (_json.JSONDecodeError, TypeError):
+                return v  # вернём как есть, пусть Pydantic выбросит свою ошибку
+        return v
 
 class OlympiadUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=100)
@@ -80,6 +94,7 @@ class OlympiadUpdate(BaseModel):
     classes: Optional[str] = Field(None, min_length=1, max_length=100)
     level: Optional[int] = Field(None, ge=1, le=3)
     link: Optional[str] = Field(None, max_length=500)
+    created_by: Optional[Dict[str, str]] = Field(None, min_length=1, max_length=200)
 
     @model_validator(mode="after")
     def check_dates(self):
@@ -101,6 +116,7 @@ class ScheduleBase(BaseModel):
     room: Optional[str] = _OPT30
     time_start: Optional[str] = _TIME
     time_end: Optional[str] = _TIME
+    status: str = Field(default="active", pattern=r"^(active|cancelled)$")
 
 class ScheduleRead(ScheduleBase):
     id: int
@@ -108,6 +124,19 @@ class ScheduleRead(ScheduleBase):
     approved_by: Optional[UserInfo] = None
     proposal_id: Optional[int] = None
     model_config = {"from_attributes": True}
+    
+    @field_validator('created_by', 'approved_by', mode='before')
+    @classmethod
+    def parse_json_user(cls, v):
+        """Парсит JSON-строку из БД в dict для валидации UserInfo"""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            try:
+                return _json.loads(v)
+            except (_json.JSONDecodeError, TypeError):
+                return v
+        return v
 
 class ScheduleUpdate(BaseModel):
     class_name: Optional[str] = Field(None, min_length=1, max_length=30)
@@ -118,6 +147,7 @@ class ScheduleUpdate(BaseModel):
     room: Optional[str] = Field(None, max_length=30)
     time_start: Optional[str] = Field(None, pattern=r"^\d{2}:\d{2}$")
     time_end: Optional[str] = Field(None, pattern=r"^\d{2}:\d{2}$")
+    status: Optional[str] = Field(None, pattern=r"^(active|cancelled)$")
 
 class ScheduleResponse(BaseModel):
     success: bool

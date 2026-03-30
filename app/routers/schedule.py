@@ -117,3 +117,55 @@ async def delete_lesson(
     except Exception as exc:
         await db.rollback()
         raise dependencies._db_error(exc) from exc
+    
+@router.post("/{lesson_id}/cancel", response_model=schemas.ScheduleResponse, dependencies=[dependencies.editors], summary="Отменить урок")
+@limiter.limit("20/minute")
+async def cancel_lesson(
+    request: Request,
+    lesson_id: int = Path(..., ge=1),
+    user: dict = Depends(dependencies.current_user),
+    db: SessionLocal = Depends(dependencies.get_db)
+):
+    try:
+        row = await db.get(ScheduleORM, lesson_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Урок не найден")
+        
+        # Устанавливаем статус cancelled, но не удаляем запись
+        row.status = "cancelled"
+        row.approved_by = _make_user_info(user)
+        
+        await db.commit()
+        await db.refresh(row)
+        return schemas.ScheduleResponse(success=True, data=[row])
+    except HTTPException: 
+        raise
+    except Exception as exc:
+        await db.rollback()
+        raise dependencies._db_error(exc) from exc
+
+@router.post("/{lesson_id}/restore", response_model=schemas.ScheduleResponse, dependencies=[dependencies.editors], summary="Восстановить урок")
+@limiter.limit("20/minute")
+async def restore_lesson(
+    request: Request,
+    lesson_id: int = Path(..., ge=1),
+    user: dict = Depends(dependencies.current_user),
+    db: SessionLocal = Depends(dependencies.get_db)
+):
+    try:
+        row = await db.get(ScheduleORM, lesson_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Урок не найден")
+        
+        # Возвращаем статус active
+        row.status = "active"
+        row.approved_by = _make_user_info(user)
+        
+        await db.commit()
+        await db.refresh(row)
+        return schemas.ScheduleResponse(success=True, data=[row])
+    except HTTPException: 
+        raise
+    except Exception as exc:
+        await db.rollback()
+        raise dependencies._db_error(exc) from exc

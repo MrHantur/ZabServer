@@ -42,6 +42,7 @@ class ScheduleORM(Base):
     room = Column(String, nullable=True)
     time_start = Column(String, nullable=True)
     time_end = Column(String, nullable=True)
+    status = Column(String, nullable=False, default="active")
     
     # Поля аудита (хранят JSON-строку с username, first_name, last_name)
     created_by = Column(String, nullable=False)
