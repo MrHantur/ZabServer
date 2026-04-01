@@ -14,5 +14,5 @@ JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_TTL = int(os.getenv("ACCESS_TOKEN_TTL", "30"))
 REFRESH_TOKEN_TTL = int(os.getenv("REFRESH_TOKEN_TTL", "43200"))
 
-if IS_DEV and JWT_SECRET == "PLACEHOLDER":
-    logger.warning("\n\nВНИМАНИЕ: JWT_SECRET это пустышка! Нужно его заменить!\n\n")
+if IS_DEV or JWT_SECRET == "PLACEHOLDER":
+    logger.warning("\n\nВНИМАНИЕ: JWT_SECRET это пустышка! Нужно его заменить! Или же вы находитесь в режиме разработчика!\n\n")

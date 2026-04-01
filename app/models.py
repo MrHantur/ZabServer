@@ -61,3 +61,14 @@ class ProposalORM(Base):
     created_at = Column(String, nullable=False)
     reviewed_by = Column(String, nullable=True)  # username ревьювера
     review_note = Column(String, nullable=True)
+
+class SurveyORM(Base):
+    __tablename__ = "surveys"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    rating_design = Column(Integer, nullable=False)
+    rating_functionality = Column(Integer, nullable=False)
+    rating_satisfaction = Column(Integer, nullable=False)
+    feedback = Column(String, nullable=True)
+    submitted_by = Column(String, nullable=True)
+    created_at = Column(String, nullable=False)

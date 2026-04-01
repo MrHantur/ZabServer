@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, Request, Path, Query, HTTPException
 from sqlalchemy import select
 from app import schemas, dependencies
 from app.database import SessionLocal
-from app.models import ScheduleORM, OlympiadORM
+from app.models import ScheduleORM, OlympiadORM, SurveyORM
 from app.core import limiter
 
 router = APIRouter(prefix="/public", tags=["Публичные"])
@@ -43,3 +43,39 @@ async def public_get_olympiad(request: Request, olympiad_id: int = Path(..., ge=
     if row is None:
         raise HTTPException(status_code=404, detail="Олимпиада не найдена")
     return schemas.OlympiadResponse(success=True, data=[row])
+
+@router.post("/survey", response_model=schemas.SurveyResponse, summary="Отправить анкету")
+@limiter.limit("10/minute")
+async def public_submit_survey(
+    request: Request, 
+    survey_data: schemas.SurveyCreate, 
+    db: SessionLocal = Depends(dependencies.get_db),
+    current_user: Optional[dict] = Depends(dependencies.optional_user)
+):
+    try:
+        # Формируем JSON-строку UserInfo (или None, если пользователь не авторизован)
+        submitted_by_json = None
+        if current_user:
+            submitted_by_json = _json.dumps({
+                "username": current_user.get("username"),
+                "first_name": current_user.get("first_name"),
+                "last_name": current_user.get("last_name")
+            })
+        
+        survey = SurveyORM(
+            rating_design=survey_data.rating_design,
+            rating_functionality=survey_data.rating_functionality,
+            rating_satisfaction=survey_data.rating_satisfaction,
+            feedback=survey_data.feedback,
+            submitted_by=submitted_by_json,
+            created_at=datetime.utcnow().isoformat()
+        )
+        
+        db.add(survey)
+        await db.commit()
+        await db.refresh(survey)
+        
+        return schemas.SurveyResponse(success=True, data=[survey])
+    except Exception as exc:
+        await db.rollback()
+        raise dependencies._db_error(exc) from exc

@@ -190,3 +190,38 @@ class ProposalResponse(BaseModel):
     success: bool
     data: List[ProposalRead]
     error: Optional[str] = None
+
+
+class SurveyCreate(BaseModel):
+    rating_design: int = Field(..., ge=1, le=5)
+    rating_functionality: int = Field(..., ge=1, le=5)
+    rating_satisfaction: int = Field(..., ge=1, le=5)
+    feedback: Optional[str] = Field(None, max_length=1000)
+
+class SurveyRead(BaseModel):
+    id: int
+    rating_design: int
+    rating_functionality: int
+    rating_satisfaction: int
+    feedback: Optional[str] = None
+    submitted_by: Optional[UserInfo] = None
+    created_at: str
+    model_config = {"from_attributes": True}
+
+    @field_validator('submitted_by', mode='before')
+    @classmethod
+    def parse_json_user(cls, v):
+        """Парсит JSON-строку из БД в объект UserInfo"""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            try:
+                return _json.loads(v)
+            except (_json.JSONDecodeError, TypeError):
+                return v
+        return v
+
+class SurveyResponse(BaseModel):
+    success: bool
+    data: List[SurveyRead]
+    error: Optional[str] = None
